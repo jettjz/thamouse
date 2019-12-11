@@ -1,0 +1,3 @@
+GNU_INSTALL_ROOT ?= /usr/local/gccArm/gcc-arm-none-eabi-9-2019-q4-major/bin/
+GNU_VERSION ?= 9.2.1
+GNU_PREFIX ?= arm-none-eabi
