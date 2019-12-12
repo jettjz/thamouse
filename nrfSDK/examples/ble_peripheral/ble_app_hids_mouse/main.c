@@ -86,19 +86,18 @@
 #include "nrf_pwr_mgmt.h"
 #include "peer_manager_handler.h"
 
-#include "nrf.h"
 #include "nrf_delay.h"
 #include "nrf_gpio.h"
 #include "nrf_pwr_mgmt.h"
-
 #include "nrfx_gpiote.h"
 #include "nrfx_saadc.h"
-
+#include "nrf_serial.h"
 
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 
+#define M_PI 3.141592653589793238462643383
 
 #define DEVICE_NAME                     "Thamouse"                                /**< Name of device. Will be included in the advertising data. */
 #define MANUFACTURER_NAME               "EE149"                       /**< Manufacturer. Will be passed to Device Information Service. */
@@ -242,6 +241,12 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
 {
     app_error_handler(DEAD_BEEF, line_num, p_file_name);
 }
+
+// callback for SAADC events
+void saadc_callback (nrfx_saadc_evt_t const * p_event) {
+  // don't care about adc callbacks
+}
+
 
 
 /**@brief Function for setting filtered whitelist.
@@ -1416,10 +1421,14 @@ int main(void)
     // Hold LED if f0 (index) is pressed
     // else toggle
     
-    if ((uint) f1 > 1500) {
+    if ((uint32_t) f1 > 1500) {
       nrf_gpio_pin_clear(RED_LED);
-    } else if ((uint) f0 > 1500) {
+      mouse_movement_send(0, 5);
+
+    } else if ((uint32_t) f0 > 1500) {
       nrf_gpio_pin_set(RED_LED);
+      mouse_movement_send(0, -5);
+
     } else {
       nrf_gpio_pin_toggle(RED_LED);
     }
