@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2014 - 2019, Nordic Semiconductor ASA
+ * Copyright (c) 2014 - 2019, Worksdic Semiconductor ASA
  *
  * All rights reserved.
  *
@@ -9,18 +9,18 @@
  * 1. Redistributions of source code must retain the above copyright notice, this
  *    list of conditions and the following disclaimer.
  *
- * 2. Redistributions in binary form, except as embedded into a Nordic
+ * 2. Redistributions in binary form, except as embedded into a Worksdic
  *    Semiconductor ASA integrated circuit in a product or a software update for
  *    such product, must reproduce the above copyright notice, this list of
  *    conditions and the following disclaimer in the documentation and/or other
  *    materials provided with the distribution.
  *
- * 3. Neither the name of Nordic Semiconductor ASA nor the names of its
+ * 3. Neither the name of Worksdic Semiconductor ASA nor the names of its
  *    contributors may be used to endorse or promote products derived from this
  *    software without specific prior written permission.
  *
  * 4. This software, with or without modification, must only be used with a
- *    Nordic Semiconductor ASA integrated circuit.
+ *    Worksdic Semiconductor ASA integrated circuit.
  *
  * 5. Any software provided in binary form under this license must not be reverse
  *    engineered, decompiled, modified and/or disassembled.
@@ -92,6 +92,7 @@
 #include "nrfx_gpiote.h"
 #include "nrfx_saadc.h"
 #include "nrf_serial.h"
+#include "nrf_drv_twi.h"
 
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
@@ -99,7 +100,7 @@
 
 #define M_PI 3.141592653589793238462643383
 
-#define DEVICE_NAME                     "Thamouse"                                /**< Name of device. Will be included in the advertising data. */
+#define DEVICE_NAME                     "Thamouse Flex Test"                                /**< Name of device. Will be included in the advertising data. */
 #define MANUFACTURER_NAME               "EE149"                       /**< Manufacturer. Will be passed to Device Information Service. */
 
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
@@ -129,7 +130,7 @@
 #define SEC_PARAM_MITM                  0                                           /**< Man In The Middle protection not required. */
 #define SEC_PARAM_LESC                  0                                           /**< LE Secure Connections not enabled. */
 #define SEC_PARAM_KEYPRESS              0                                           /**< Keypress notifications not enabled. */
-#define SEC_PARAM_IO_CAPABILITIES       BLE_GAP_IO_CAPS_NONE                        /**< No I/O capabilities. */
+#define SEC_PARAM_IO_CAPABILITIES       BLE_GAP_IO_CAPS_NONE                        /**< WorksI/O capabilities. */
 #define SEC_PARAM_OOB                   0                                           /**< Out Of Band data not available. */
 #define SEC_PARAM_MIN_KEY_SIZE          7                                           /**< Minimum encryption key size. */
 #define SEC_PARAM_MAX_KEY_SIZE          16                                          /**< Maximum encryption key size. */
@@ -171,6 +172,8 @@
 #define APP_ADV_FAST_DURATION           3000                                        /**< The advertising duration of fast advertising in units of 10 milliseconds. */
 #define APP_ADV_SLOW_DURATION           18000                                       /**< The advertising duration of slow advertising in units of 10 milliseconds. */
 
+#define FSR 3.6
+
 // ADC channels
 #define X_CHANNEL 0
 #define Y_CHANNEL 1
@@ -182,6 +185,25 @@
 // LED is pin 17
 #define RED_LED NRF_GPIO_PIN_MAP(0,17)
 
+#define BLUE_LED NRF_GPIO_PIN_MAP(0,19)
+
+#if TWI0_ENABLED
+#define TWI_INSTANCE_ID     0
+#elif TWI1_ENABLED
+#define TWI_INSTANCE_ID     1
+#endif
+
+#define IR_ADDR 0x58
+
+/* IR data struct */ 
+typedef struct ir_coords
+{
+    uint16_t x[4];
+    uint16_t y[4];
+} ir_points;
+
+/* TWI instance. */
+static const nrf_drv_twi_t m_twi = NRF_DRV_TWI_INSTANCE(TWI_INSTANCE_ID);
 
 APP_TIMER_DEF(m_battery_timer_id);                                                  /**< Battery timer. */
 BLE_BAS_DEF(m_bas);                                                                 /**< Battery service instance. */
@@ -193,6 +215,9 @@ BLE_HIDS_DEF(m_hids,                                                            
 NRF_BLE_GATT_DEF(m_gatt);                                                           /**< GATT module instance. */
 NRF_BLE_QWR_DEF(m_qwr);                                                             /**< Context for the Queued Write module.*/
 BLE_ADVERTISING_DEF(m_advertising);                                                 /**< Advertising module instance. */
+//static float fsr = 3.6; // = 1*reference / gain; where m = 1 because our range is 0 to Vref
+static float lsb = FSR/4096.0; // 2^N; N = 12 from above
+
 
 static bool              m_in_boot_mode = false;                                    /**< Current protocol mode. */
 static uint16_t          m_conn_handle  = BLE_CONN_HANDLE_INVALID;                  /**< Handle of the current connection. */
@@ -222,6 +247,12 @@ static ble_advdata_manuf_data_t m_sp_manuf_advdata =                            
 };
 static ble_advdata_t m_sp_advdata;
 #endif
+
+ir_points coords = 
+{
+    .x = {0,0,0,0},
+    .y = {0,0,0,0}
+};
 
 static void on_hids_evt(ble_hids_t * p_hids, ble_hids_evt_t * p_evt);
 
@@ -339,7 +370,7 @@ static void pm_evt_handler(pm_evt_t const * p_evt)
                  && (p_evt->params.peer_data_update_succeeded.data_id == PM_PEER_DATA_ID_BONDING))
             {
                 NRF_LOG_INFO("New Bond, add the peer to the whitelist if possible");
-                // Note: You should check on what kind of white list policy your application should use.
+                // Workse: You should check on what kind of white list policy your application should use.
 
                 whitelist_set(PM_PEER_ID_LIST_SKIP_NO_ID_ADDR);
             }
@@ -396,6 +427,7 @@ static void battery_level_update(void)
     }
 }
 
+//RYAN REMEMBER THIS!
 
 /**@brief Function for handling the Battery measurement timer timeout.
  *
@@ -816,7 +848,7 @@ static void on_hids_evt(ble_hids_t * p_hids, ble_hids_evt_t * p_evt)
             break;
 
         default:
-            // No implementation needed.
+            // Worksimplementation needed.
             break;
     }
 }
@@ -993,7 +1025,7 @@ static void ble_evt_handler(ble_evt_t const * p_ble_evt, void * p_context)
             break;
 
         default:
-            // No implementation needed.
+            // Worksimplementation needed.
             break;
     }
 }
@@ -1273,27 +1305,16 @@ static void power_management_init(void)
 }
 
 
-/**@brief Function for handling the idle state (main loop).
- *
- * @details If there is no pending log operation, then sleep until next the next event occurs.
- */
-// static void idle_state_handle(void)
-// {
-//     app_sched_execute();
-//     if (NRF_LOG_PROCESS() == false)
-//     {
-//         nrf_pwr_mgmt_run();
-//     }
-// }
+
 
 static void my_handler(void)
 {
   ret_code_t error_code = NRF_SUCCESS;
 
   // initialize RTT library
-  error_code = NRF_LOG_INIT(NULL);
-  APP_ERROR_CHECK(error_code);
-  NRF_LOG_DEFAULT_BACKENDS_INIT();
+  //error_code = NRF_LOG_INIT(NULL);
+  //APP_ERROR_CHECK(error_code);
+  //NRF_LOG_DEFAULT_BACKENDS_INIT();
   // initialize GPIO driver
   if (!nrfx_gpiote_is_init()) {
     error_code = nrfx_gpiote_init();
@@ -1352,47 +1373,198 @@ nrf_saadc_value_t sample_value (uint8_t channel) {
   return val;
 }
 
-/**@brief Function for application main entry.
- */
-int main(void)
-{
-    bool erase_bonds;
+void ir_setup(void) {
+    ret_code_t err_code;
 
-    // Initialize.
-    log_init();
-    timers_init();
-    buttons_leds_init(&erase_bonds);
-    power_management_init();
-    ble_stack_init();
-    scheduler_init();
-    gap_params_init();
-    gatt_init();
-    advertising_init();
-    services_init();
-    sensor_simulator_init();
-    conn_params_init();
-    peer_manager_init();
-    my_handler();
+    const nrf_drv_twi_config_t twi_config = {
+       .scl                = 26, //ARDUINO_SCL_PIN,
+       .sda                = 25, //ARDUINO_SDA_PIN,
+       .frequency          = NRF_DRV_TWI_FREQ_100K,
+       .interrupt_priority = APP_IRQ_PRIORITY_HIGH,
+       .clear_bus_init     = false
+    };
 
-    // Start execution.
-    NRF_LOG_INFO("HID Mouse example started.");
-    timers_start();
-    advertising_start(erase_bonds);
+    err_code = nrf_drv_twi_init(&m_twi, &twi_config, NULL, NULL);
+    APP_ERROR_CHECK(err_code);
 
-    // // Enter main loop.
-    // for (;;)
-    // {
-    //     idle_state_handle();
-    // }
-    while (1) {
-        app_sched_execute();
+     nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy\n");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+        NRF_LOG_INFO("Fail 0");
+    }
+
+    nrf_delay_ms(100);
+
+    nrf_drv_twi_enable(&m_twi);
+
+    uint8_t package[2]; 
+    //Send #1: 0x30, 0x01 NEW: 0x13, 0x04
+    package[0] = 0x13;
+    package[1] = 0x04;
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
+    nrf_delay_ms(100);
+   
+    nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy\n");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+        NRF_LOG_INFO("Fail 1");
+    }
+
+    //Send #2: 0x30, 0x08 NEW: 0x1a, 0x04
+    package[0] = 0x1a;
+    package[1] = 0x04;
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
+    nrf_delay_ms(100);   
+    
+    nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+        NRF_LOG_INFO("Fail 2");
+    }
+    //Send #3: 0x06, 0x90 NEW: 0x30, 0x08
+    package[0] = 0x30;
+    package[1] = 0x08;
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
+    nrf_delay_ms(100);
+    
+    nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+        NRF_LOG_INFO("Fail 3");
+    }
+
+    //Send #4: 0x08, 0xc0 NEW: SENSTITIVITY 1
+    package[0] = 0x08;
+    package[1] = 0xc0;
+    uint8_t sens1[10]= {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x00, 0xC0};
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) sens1, sizeof(sens1), false);
+    nrf_delay_ms(100);
+   
+     nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy");
+        NRF_LOG_INFO("Fail 4");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+    }
+    //Send #5: 0x1a, 0x40 NEW: SENSITIVITY 2
+    package[0] = 0x1a;
+    package[1] = 0x40;
+    uint8_t sens2[3] = {0x1a, 0x40, 0x00};
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) sens2, sizeof(sens2), false);
+    nrf_delay_ms(100);
+    
+    nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+        NRF_LOG_INFO("Fail 5");
+    }
+    //Send #6: 0x33, 0x33
+    package[0] = 0x33;
+    package[1] = 0x03;
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
+    nrf_delay_ms(100);
+
+    nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+        NRF_LOG_INFO("Fail 6");
+    }
+    //Final init: 0x36 NEW 0x30, 0x08
+    package[0] = 0x30;
+    package[1] = 0x08;
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
+    nrf_delay_ms(100); 
+   
+    nrf_gpio_pin_clear(RED_LED);
+    if (err_code == NRF_SUCCESS) {
+        nrf_gpio_pin_clear(BLUE_LED);
+        NRF_LOG_INFO("Works");
+    } else if (err_code == NRF_ERROR_BUSY){
+        nrf_gpio_pin_set(BLUE_LED);
+        NRF_LOG_INFO("busy");
+    } else {
+        nrf_gpio_pin_set(RED_LED);    
+        NRF_LOG_INFO("Fail 7");
+    }
+}
+
+void ir_read(ir_points *pts) {
+    uint8_t irIn[12];
+    uint8_t s;
+    nrf_drv_twi_rx(&m_twi, IR_ADDR, (uint8_t*) irIn, sizeof(irIn));
+    pts->x[0] = irIn[0];
+    pts->y[0] = irIn[2];
+    s = irIn[3];
+    pts->x[0] += (s & 0x30) << 4;
+    pts->y[0] += (s & 0xc0) << 2;
+    
+    pts->x[1] = irIn[3];
+    pts->y[1] = irIn[4];
+    s = irIn[5];
+    pts->x[1] += (s & 0x30) << 4;
+    pts->y[1] += (s & 0xc0) << 2;
+
+    pts->x[2] = irIn[6];
+    pts->y[2] = irIn[7];
+    s = irIn[8];
+    pts->x[2] += (s & 0x30) << 4;
+    pts->y[2] += (s & 0xc0) << 2;
+
+    pts->x[3] = irIn[9];
+    pts->y[3] = irIn[10];
+    s = irIn[11];
+    pts->x[3] += (s & 0x30) << 4;
+    pts->y[3] += (s & 0xc0) << 2;
+    
+}
+
+void glove_read(void) {
     // sample analog inputs
     nrf_saadc_value_t x_val = sample_value(X_CHANNEL);
     nrf_saadc_value_t y_val = sample_value(Y_CHANNEL);
     nrf_saadc_value_t z_val = sample_value(Z_CHANNEL);
 
-    float fsr = 3.6; // = 1*reference / gain; where m = 1 because our range is 0 to Vref
-    float lsb = fsr/(pow(2,12)); // 2^N; N = 12 from above
     float x_volt = lsb*x_val;
     float y_volt = lsb*y_val;
     float z_volt = lsb*z_val;
@@ -1414,7 +1586,7 @@ int main(void)
     printf("Tilt\tx: %9.6f\ty: %9.6f\tz:%9.6f\n", x_tilt, y_tilt, z_tilt);
     nrf_saadc_value_t f0 = sample_value(FINGER_0);
     nrf_saadc_value_t f1 = sample_value(FINGER_1);
-    nrf_saadc_value_t f2 = sample_value(FINGER_2);
+    //nrf_saadc_value_t f2 = sample_value(FINGER_2);
 
 
     // Clear LED if f1 (middle finger) pressed
@@ -1422,21 +1594,77 @@ int main(void)
     // else toggle
     
     if ((uint32_t) f1 > 1500) {
-      nrf_gpio_pin_clear(RED_LED);
       mouse_movement_send(0, 5);
 
     } else if ((uint32_t) f0 > 1500) {
-      nrf_gpio_pin_set(RED_LED);
       mouse_movement_send(0, -5);
 
-    } else {
-      nrf_gpio_pin_toggle(RED_LED);
     }
 
-    printf("Finger0:\t%u\tFinger1:\t%uFinger2:\t%u\n", f0, f1, f2);
-    nrf_delay_ms(100);
 
-  }
+}
+
+/**@brief Function for handling the idle state (main loop).
+ *
+ * @details If there is no pending log operation, then sleep until next the next event occurs.
+ */
+static void idle_state_handle(void)
+{
+    app_sched_execute();
+    if (NRF_LOG_PROCESS() == false)
+    {
+        nrf_pwr_mgmt_run();
+    }
+    
+}
+
+/**@brief Function for application main entry.
+ */
+int main(void)
+{
+    bool erase_bonds;
+
+    // Initialize.
+    log_init();
+    timers_init();
+    buttons_leds_init(&erase_bonds); 
+    power_management_init();
+    ble_stack_init();
+    scheduler_init();
+    gap_params_init();
+    gatt_init();
+    advertising_init();
+    services_init();
+    sensor_simulator_init();
+    conn_params_init();
+    peer_manager_init();
+    NRF_LOG_INFO("IR SETUP...");
+    my_handler();
+    ir_setup();
+    // Start execution.
+    timers_start();
+    advertising_start(erase_bonds);
+
+
+    // Enter main loop.
+    for (;;)
+    {
+       idle_state_handle();
+        if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
+        {
+            glove_read();
+        }
+
+        ir_read(&coords);
+        nrf_delay_ms(50);
+        for (int i = 0; i < 4; i++) {
+            NRF_LOG_INFO("X%d: %d", i, coords.x[i]);
+            nrf_delay_ms(50);
+            NRF_LOG_INFO("Y%d: %d", i, coords.y[i]);
+            nrf_delay_ms(50);
+        }  
+        
+    } 
 }
 
 
