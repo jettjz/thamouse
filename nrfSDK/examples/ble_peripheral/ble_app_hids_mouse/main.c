@@ -98,10 +98,8 @@
 #include "nrf_log_ctrl.h"
 #include "nrf_log_default_backends.h"
 
-#define M_PI 3.141592653589793238462643383
-
-#define DEVICE_NAME                     "Thamouse Flex Test"                                /**< Name of device. Will be included in the advertising data. */
-#define MANUFACTURER_NAME               "EE149"                       /**< Manufacturer. Will be passed to Device Information Service. */
+#define DEVICE_NAME                     "Thamouse"                                  /**< Name of device. Will be included in the advertising data. */
+#define MANUFACTURER_NAME               "EE149"                                     /**< Manufacturer. Will be passed to Device Information Service. */
 
 #define APP_BLE_OBSERVER_PRIO           3                                           /**< Application's BLE observer priority. You shouldn't need to modify this value. */
 #define APP_BLE_CONN_CFG_TAG            1                                           /**< A tag identifying the SoftDevice BLE configuration. */
@@ -172,19 +170,33 @@
 #define APP_ADV_FAST_DURATION           3000                                        /**< The advertising duration of fast advertising in units of 10 milliseconds. */
 #define APP_ADV_SLOW_DURATION           18000                                       /**< The advertising duration of slow advertising in units of 10 milliseconds. */
 
+// ****************************************************************************************************
+// Begin Thamouse-specific globals
+
 #define FSR 3.6
+
+#define M_PI 3.141592653589793238462643383
+
+// Scrolling constants
+#define SCROLL_SPEED 5 // TODO: Calibrate
+#define X_TILT_THRESHOLD 5 // TODO: Calibrate
+#define Y_TILT_THRESHOLD 5 // TODO: Calibrate
 
 // ADC channels
 #define X_CHANNEL 0
 #define Y_CHANNEL 1
 #define Z_CHANNEL 2
 #define FINGER_0 3
+#define F0_THRESH 2500
 #define FINGER_1 4
+#define F1_THRESH 1500
 #define FINGER_2 5
+#define F2_THRESH 1500
+#define FINGER_3 6
+#define F3_THRESH 1500
 
-// LED is pin 17
+// LED is pins 17 and 19
 #define RED_LED NRF_GPIO_PIN_MAP(0,17)
-
 #define BLUE_LED NRF_GPIO_PIN_MAP(0,19)
 
 #if TWI0_ENABLED
@@ -194,6 +206,13 @@
 #endif
 
 #define IR_ADDR 0x58
+//TODO Recheck supply voltage
+#define SUPPLY 2.8
+
+//Timeouts for flex, imu, IR.  TODO: make smaller interval
+#define FLEX_MEAS_INTERVAL     APP_TIMER_TICKS(200)                       /**< Flex sensor measurement interval (ticks). */
+#define IMU_MEAS_INTERVAL     APP_TIMER_TICKS(200)                       /**< IMU sensor measurement interval (ticks). */
+#define IR_MEAS_INTERVAL     APP_TIMER_TICKS(200)                       /**< IR sensor measurement interval (ticks). */
 
 /* IR data struct */ 
 typedef struct ir_coords
@@ -202,8 +221,26 @@ typedef struct ir_coords
     uint16_t y[4];
 } ir_points;
 
+ir_points coords = 
+{
+    .x = {0,0,0,0},
+    .y = {0,0,0,0}
+};
+
+int16_t clicked[2] = {0, 0};
+
+//static float fsr = 3.6; // = 1*reference / gain; where m = 1 because our range is 0 to Vref
+static float lsb = FSR/4096.0; // 2^N; N = 12 from above
+
+static float expected_sensitivity = 300.0*SUPPLY/3;
+static float expected_bias = 1.5*SUPPLY/3;
+APP_TIMER_DEF(m_flex_timer_id);                                                  /**< Flex timer. */ 
+
 /* TWI instance. */
 static const nrf_drv_twi_t m_twi = NRF_DRV_TWI_INSTANCE(TWI_INSTANCE_ID);
+
+// End Thamouse-specific globals
+// ****************************************************************************************************
 
 APP_TIMER_DEF(m_battery_timer_id);                                                  /**< Battery timer. */
 BLE_BAS_DEF(m_bas);                                                                 /**< Battery service instance. */
@@ -215,8 +252,6 @@ BLE_HIDS_DEF(m_hids,                                                            
 NRF_BLE_GATT_DEF(m_gatt);                                                           /**< GATT module instance. */
 NRF_BLE_QWR_DEF(m_qwr);                                                             /**< Context for the Queued Write module.*/
 BLE_ADVERTISING_DEF(m_advertising);                                                 /**< Advertising module instance. */
-//static float fsr = 3.6; // = 1*reference / gain; where m = 1 because our range is 0 to Vref
-static float lsb = FSR/4096.0; // 2^N; N = 12 from above
 
 
 static bool              m_in_boot_mode = false;                                    /**< Current protocol mode. */
@@ -248,15 +283,12 @@ static ble_advdata_manuf_data_t m_sp_manuf_advdata =                            
 static ble_advdata_t m_sp_advdata;
 #endif
 
-ir_points coords = 
-{
-    .x = {0,0,0,0},
-    .y = {0,0,0,0}
-};
 
+// These are used above being written.
 static void on_hids_evt(ble_hids_t * p_hids, ble_hids_evt_t * p_evt);
-
-
+static void mouse_movement_send(int16_t x_delta, int16_t y_delta);
+static void mouse_click_send(int16_t click, int16_t scroll_v, int16_t scroll_h);
+    
 /**@brief Callback function for asserts in the SoftDevice.
  *
  * @details This function will be called in case of an assert in the SoftDevice.
@@ -273,12 +305,24 @@ void assert_nrf_callback(uint16_t line_num, const uint8_t * p_file_name)
     app_error_handler(DEAD_BEEF, line_num, p_file_name);
 }
 
-// callback for SAADC events
-void saadc_callback (nrfx_saadc_evt_t const * p_event) {
+/**@brief Project Thamouse: Dummy function for adc callbacks.
+ */
+void saadc_callback (nrfx_saadc_evt_t const * p_event) 
+{
   // don't care about adc callbacks
 }
 
-
+/**@brief Project Thamouse Function to sample a particular analog channel in blocking mode
+ *
+ * @param[in] channel   Channel to sample
+ */
+nrf_saadc_value_t sample_value (uint8_t channel) 
+{
+  nrf_saadc_value_t val;
+  ret_code_t error_code = nrfx_saadc_sample_convert(channel, &val);
+  APP_ERROR_CHECK(error_code);
+  return val;
+}
 
 /**@brief Function for setting filtered whitelist.
  *
@@ -427,8 +471,6 @@ static void battery_level_update(void)
     }
 }
 
-//RYAN REMEMBER THIS!
-
 /**@brief Function for handling the Battery measurement timer timeout.
  *
  * @details This function will be called each time the battery level measurement timer expires.
@@ -442,6 +484,262 @@ static void battery_level_meas_timeout_handler(void * p_context)
     battery_level_update();
 }
 
+/**@brief Project Thamouse: Function for reading in data from IR sensor.
+ */
+static void ir_read(ir_points *pts) 
+{
+    //Note: Send 0x36 to sensor. Apparently first byte is garbage??
+    uint8_t irIn[13];
+    uint16_t s;
+    irIn[0] = 0x36;
+    nrf_drv_twi_tx(&m_twi, IR_ADDR, irIn, 1, false);
+    nrf_delay_ms(100);
+    nrf_drv_twi_rx(&m_twi, IR_ADDR, (uint8_t*) irIn, sizeof(irIn));
+    pts->x[0] = irIn[1];
+    pts->y[0] = irIn[2];
+    s = irIn[3];
+    pts->x[0] += (s & 0x30) << 4;
+    pts->y[0] += (s & 0xc0) << 2;
+    
+    pts->x[1] = irIn[4];
+    pts->y[1] = irIn[5];
+    s = irIn[6];
+    pts->x[1] += (s & 0x30) << 4;
+    pts->y[1] += (s & 0xc0) << 2;
+
+    pts->x[2] = irIn[7];
+    pts->y[2] = irIn[8];
+    s = irIn[9];
+    pts->x[2] += (s & 0x30) << 4;
+    pts->y[2] += (s & 0xc0) << 2;
+
+    pts->x[3] = irIn[10];
+    pts->y[3] = irIn[11];
+    s = irIn[12];
+    pts->x[3] += (s & 0x30) << 4;
+    pts->y[3] += (s & 0xc0) << 2;
+   
+
+    //DEBUG
+    for (int i = 0; i < 4; i++) 
+    {
+        NRF_LOG_INFO("X%d: %d", i, coords.x[i]);
+        NRF_LOG_INFO("Y%d: %d", i, coords.y[i]);
+    }   
+}
+
+/**@brief Project Thamouse: Function to read data from the IMU
+ */
+static void imu_read(void) 
+{
+    // sample analog inputs
+    nrf_saadc_value_t x_val = sample_value(X_CHANNEL);
+    nrf_saadc_value_t y_val = sample_value(Y_CHANNEL);
+    nrf_saadc_value_t z_val = sample_value(Z_CHANNEL);
+
+    float x_volt = lsb*x_val;
+    float y_volt = lsb*y_val;
+    float z_volt = lsb*z_val;
+
+
+    float x_g = 1000*(x_volt - expected_bias)/(expected_sensitivity);
+    float y_g = 1000*(y_volt - expected_bias)/(expected_sensitivity);
+    float z_g = 1000*(z_volt - expected_bias)/(expected_sensitivity);
+
+    float x_tilt = (180/M_PI)*atan(x_g/sqrt(pow(y_g,2) + pow(z_g,2)));
+    float y_tilt = (180/M_PI)*atan(y_g/sqrt(pow(x_g,2) + pow(z_g,2)));
+    float z_tilt = (180/M_PI)*atan(sqrt(pow(x_g,2) + pow(y_g,2))/z_g);
+
+    // DEBUG: display results
+    NRF_LOG_INFO("g-forces\tx: %9.6f\ty: %9.6f\tz:%9.6f\n", x_g, y_g, z_g);
+    NRF_LOG_INFO("Tilt\tx: %9.6f\ty: %9.6f\tz:%9.6f\n", x_tilt, y_tilt, z_tilt); 
+
+    // Scroll up if pointing up, down if pointing down (beyond a threashold).
+    if (x_tilt > X_TILT_THRESHOLD) 
+    {
+        mouse_click_send(0, SCROLL_SPEED, 0);
+    } else if (x_tilt < -X_TILT_THRESHOLD)
+    {
+        mouse_click_send(0, -SCROLL_SPEED, 0);
+    }
+
+    // Scroll to sides based on tilt.
+    if (y_tilt > Y_TILT_THRESHOLD) 
+    {
+        mouse_click_send(0, 0, SCROLL_SPEED);
+    } else if (y_tilt < -Y_TILT_THRESHOLD)
+    {
+        mouse_click_send(0, 0, -SCROLL_SPEED);
+    }
+}
+
+/**@brief Project Thamouse: Function for sending a Mouse Click.
+ *
+ * @param[in]   click   Click data.
+ * @param[in]   scroll_v    Vertical scrolling delta
+ * @param[in]   scroll_h    Horizontal scrolling delta
+ */
+static void mouse_click_send(int16_t click, int16_t scroll_v, int16_t scroll_h)
+{
+    ret_code_t err_code;
+
+    if (m_in_boot_mode)
+    {
+        err_code = ble_hids_boot_mouse_inp_rep_send(&m_hids,
+                                                    click,
+                                                    0x00,
+                                                    0x00,
+                                                    0,
+                                                    NULL,
+                                                    m_conn_handle);
+    }
+    else
+    {
+        uint8_t buffer[INPUT_REP_BUTTONS_LEN];
+
+        APP_ERROR_CHECK_BOOL(INPUT_REP_BUTTONS_LEN == 3);
+
+        buffer[0] = click;
+        buffer[1] = scroll_v;
+        buffer[2] = scroll_h;
+
+        err_code = ble_hids_inp_rep_send(&m_hids,
+                                         INPUT_REP_BUTTONS_INDEX,
+                                         INPUT_REP_BUTTONS_LEN,
+                                         buffer,
+                                         m_conn_handle);
+    }
+
+    if ((err_code != NRF_SUCCESS) &&
+        (err_code != NRF_ERROR_INVALID_STATE) &&
+        (err_code != NRF_ERROR_RESOURCES) &&
+        (err_code != NRF_ERROR_BUSY) &&
+        (err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)
+       )
+    {
+        APP_ERROR_HANDLER(err_code);
+    }
+}
+
+/**@brief Function for sending a Mouse Movement.
+ *
+ * @param[in]   x_delta   Horizontal movement.
+ * @param[in]   y_delta   Vertical movement.
+ */
+static void mouse_movement_send(int16_t x_delta, int16_t y_delta)
+{
+    ret_code_t err_code;
+
+    if (m_in_boot_mode)
+    {
+        x_delta = MIN(x_delta, 0x00ff);
+        y_delta = MIN(y_delta, 0x00ff);
+
+        err_code = ble_hids_boot_mouse_inp_rep_send(&m_hids,
+                                                    0x00,
+                                                    (int8_t)x_delta,
+                                                    (int8_t)y_delta,
+                                                    0,
+                                                    NULL,
+                                                    m_conn_handle);
+    }
+    else
+    {
+        uint8_t buffer[INPUT_REP_MOVEMENT_LEN];
+
+        APP_ERROR_CHECK_BOOL(INPUT_REP_MOVEMENT_LEN == 3);
+
+        x_delta = MIN(x_delta, 0x0fff);
+        y_delta = MIN(y_delta, 0x0fff);
+
+        buffer[0] = x_delta & 0x00ff;
+        buffer[1] = ((y_delta & 0x000f) << 4) | ((x_delta & 0x0f00) >> 8);
+        buffer[2] = (y_delta & 0x0ff0) >> 4;
+
+        err_code = ble_hids_inp_rep_send(&m_hids,
+                                         INPUT_REP_MOVEMENT_INDEX,
+                                         INPUT_REP_MOVEMENT_LEN,
+                                         buffer,
+                                         m_conn_handle);
+    }
+
+    if ((err_code != NRF_SUCCESS) &&
+        (err_code != NRF_ERROR_INVALID_STATE) &&
+        (err_code != NRF_ERROR_RESOURCES) &&
+        (err_code != NRF_ERROR_BUSY) &&
+        (err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)
+       )
+    {
+        APP_ERROR_HANDLER(err_code);
+    }
+}
+
+/**@brief Project Thamouse: Function for reading data from the flex sensors.  Calls the IR and IMU 
+ * reads depending on gesture input.
+ */
+static void flex_read(void) 
+{
+    nrf_saadc_value_t f0 = sample_value(FINGER_0); // Index Finger
+    nrf_saadc_value_t f1 = sample_value(FINGER_1); // Middle Finger
+    nrf_saadc_value_t f2 = sample_value(FINGER_2); // Ring Finger 
+    nrf_saadc_value_t f3 = sample_value(FINGER_3); // Thumb (I hope...)
+
+    NRF_LOG_INFO("Index: %d", (uint32_t) f0);
+    NRF_LOG_INFO("Middle: %d", (uint32_t) f1);
+    NRF_LOG_INFO("Ring: %d", (uint32_t) f2);
+    NRF_LOG_INFO("Thumb: %d", (uint32_t) f3);
+
+    // Left (standard) click is index finger
+    if ((uint32_t) f0 > F0_THRESH && !clicked[0]) 
+    {
+        mouse_click_send(1, 0, 0);
+        clicked[0] = 1;
+
+    } else if (clicked[0]){
+        mouse_click_send(0, 0, 0);
+        clicked[0] = 0;
+    }
+    
+    // Rignt (secondary) click is thumb
+    if ((uint32_t) f3 > F3_THRESH && !clicked[1])  //Check calibration number.
+    {
+        mouse_click_send(2, 0, 0);
+        clicked[1] = 1;
+
+    } else if (clicked[1]){
+        mouse_click_send(0, 0, 0);
+        clicked[1] = 0;
+    }
+    
+    // When all fingers are extended (relaxed), use IMU to detect gestures.
+    if ((uint32_t) f0 < F0_THRESH && (uint32_t) f1 < F1_THRESH && (uint32_t) f2 < F2_THRESH) 
+    {
+        imu_read();
+    } else if ((uint32_t) f1 > F1_THRESH && (uint32_t) f2 > F2_THRESH) // When all fingers but index are curled, use IR to detect movement. 
+    {
+        ir_read(&coords);
+    } 
+    
+    if (0) {
+        mouse_movement_send(0, 0); 
+    }
+}
+
+/**@brief Project Thamouse: Function for handling the sensors timer timeout.
+ *
+ * @details This function will be called each time the sensors measurement timer expires.
+ *
+ * @param[in]   p_context   Pointer used for passing some arbitrary information (context) from the
+ *                          app_start_timer() call to the timeout handler.
+ */
+static void sensors_handler(void *p_context) {
+    //Don't bother reading data if not connected.
+    if (m_conn_handle != BLE_CONN_HANDLE_INVALID) 
+    { 
+        UNUSED_PARAMETER(p_context);
+        flex_read();
+    }
+}
 
 /**@brief Function for the Timer initialization.
  *
@@ -459,6 +757,13 @@ static void timers_init(void)
                                 APP_TIMER_MODE_REPEATED,
                                 battery_level_meas_timeout_handler);
     APP_ERROR_CHECK(err_code);
+
+    // Create sensors timer for Thamouse.
+    err_code = app_timer_create(&m_flex_timer_id,
+                                APP_TIMER_MODE_REPEATED,
+                                sensors_handler);
+    APP_ERROR_CHECK(err_code);
+
 }
 
 
@@ -801,6 +1106,9 @@ static void timers_start(void)
 
     err_code = app_timer_start(m_battery_timer_id, BATTERY_LEVEL_MEAS_INTERVAL, NULL);
     APP_ERROR_CHECK(err_code);
+    // Start Thamouse sensor polling
+    err_code = app_timer_start(m_flex_timer_id, FLEX_MEAS_INTERVAL, NULL);
+    APP_ERROR_CHECK(err_code);
 }
 
 
@@ -1142,58 +1450,6 @@ static void scheduler_init(void)
 }
 
 
-/**@brief Function for sending a Mouse Movement.
- *
- * @param[in]   x_delta   Horizontal movement.
- * @param[in]   y_delta   Vertical movement.
- */
-static void mouse_movement_send(int16_t x_delta, int16_t y_delta)
-{
-    ret_code_t err_code;
-
-    if (m_in_boot_mode)
-    {
-        x_delta = MIN(x_delta, 0x00ff);
-        y_delta = MIN(y_delta, 0x00ff);
-
-        err_code = ble_hids_boot_mouse_inp_rep_send(&m_hids,
-                                                    0x00,
-                                                    (int8_t)x_delta,
-                                                    (int8_t)y_delta,
-                                                    0,
-                                                    NULL,
-                                                    m_conn_handle);
-    }
-    else
-    {
-        uint8_t buffer[INPUT_REP_MOVEMENT_LEN];
-
-        APP_ERROR_CHECK_BOOL(INPUT_REP_MOVEMENT_LEN == 3);
-
-        x_delta = MIN(x_delta, 0x0fff);
-        y_delta = MIN(y_delta, 0x0fff);
-
-        buffer[0] = x_delta & 0x00ff;
-        buffer[1] = ((y_delta & 0x000f) << 4) | ((x_delta & 0x0f00) >> 8);
-        buffer[2] = (y_delta & 0x0ff0) >> 4;
-
-        err_code = ble_hids_inp_rep_send(&m_hids,
-                                         INPUT_REP_MOVEMENT_INDEX,
-                                         INPUT_REP_MOVEMENT_LEN,
-                                         buffer,
-                                         m_conn_handle);
-    }
-
-    if ((err_code != NRF_SUCCESS) &&
-        (err_code != NRF_ERROR_INVALID_STATE) &&
-        (err_code != NRF_ERROR_RESOURCES) &&
-        (err_code != NRF_ERROR_BUSY) &&
-        (err_code != BLE_ERROR_GATTS_SYS_ATTR_MISSING)
-       )
-    {
-        APP_ERROR_HANDLER(err_code);
-    }
-}
 
 
 /**@brief Function for handling events from the BSP module.
@@ -1227,34 +1483,6 @@ static void bsp_event_handler(bsp_event_t event)
                 {
                     APP_ERROR_CHECK(err_code);
                 }
-            }
-            break;
-
-        case BSP_EVENT_KEY_0:
-            if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
-            {
-                mouse_movement_send(-MOVEMENT_SPEED, 0);
-            }
-            break;
-
-        case BSP_EVENT_KEY_1:
-            if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
-            {
-                mouse_movement_send(0, -MOVEMENT_SPEED);
-            }
-            break;
-
-        case BSP_EVENT_KEY_2:
-            if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
-            {
-                mouse_movement_send(MOVEMENT_SPEED, 0);
-            }
-            break;
-
-        case BSP_EVENT_KEY_3:
-            if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
-            {
-                mouse_movement_send(0, MOVEMENT_SPEED);
             }
             break;
 
@@ -1306,20 +1534,18 @@ static void power_management_init(void)
 
 
 
-
-static void my_handler(void)
+/**@brief Project Thamouse: Function for setup for flex sensors and IMU.
+ */
+static void analog_sensor_setup(void)
 {
   ret_code_t error_code = NRF_SUCCESS;
 
-  // initialize RTT library
-  //error_code = NRF_LOG_INIT(NULL);
-  //APP_ERROR_CHECK(error_code);
-  //NRF_LOG_DEFAULT_BACKENDS_INIT();
   // initialize GPIO driver
   if (!nrfx_gpiote_is_init()) {
     error_code = nrfx_gpiote_init();
   }
   APP_ERROR_CHECK(error_code);
+
   // initialize analog to digital converter
   nrfx_saadc_config_t saadc_config = NRFX_SAADC_DEFAULT_CONFIG;
   saadc_config.resolution = NRF_SAADC_RESOLUTION_12BIT;
@@ -1333,12 +1559,12 @@ static void my_handler(void)
   channel_config.reference = NRF_SAADC_REFERENCE_INTERNAL; // 0.6 Volt reference, input after gain can be 0 to 0.6 Volts
 
   // specify input pin and initialize that ADC channel
-  channel_config.pin_p = NRF_SAADC_INPUT_AIN3;//BUCKLER_ANALOG_ACCEL_X;
+  channel_config.pin_p = NRF_SAADC_INPUT_AIN4;//BUCKLER_ANALOG_ACCEL_X;
   error_code = nrfx_saadc_channel_init(X_CHANNEL, &channel_config);
   APP_ERROR_CHECK(error_code);
 
   // specify input pin and initialize that ADC channel
-  channel_config.pin_p = NRF_SAADC_INPUT_AIN4; //BUCKLER_ANALOG_ACCEL_Y;
+  channel_config.pin_p = NRF_SAADC_INPUT_AIN5; //BUCKLER_ANALOG_ACCEL_Y;
   error_code = nrfx_saadc_channel_init(Y_CHANNEL, &channel_config);
   APP_ERROR_CHECK(error_code);
 
@@ -1348,7 +1574,7 @@ static void my_handler(void)
   APP_ERROR_CHECK(error_code);
 
   // TODO: Shuould eventually have to make this AIN8 but need to manually configure pin
-  channel_config.pin_p = NRF_SAADC_INPUT_AIN5;
+  channel_config.pin_p = NRF_SAADC_INPUT_AIN3;
   error_code = nrfx_saadc_channel_init(FINGER_0, &channel_config);
   APP_ERROR_CHECK(error_code);
 
@@ -1359,26 +1585,30 @@ static void my_handler(void)
   channel_config.pin_p = NRF_SAADC_INPUT_AIN2; 
   error_code = nrfx_saadc_channel_init(FINGER_2, &channel_config);
   APP_ERROR_CHECK(error_code);
+    // TODO: UNTESTED!!!!
+  channel_config.pin_p = NRF_SAADC_INPUT_AIN0; 
+  error_code = nrfx_saadc_channel_init(FINGER_3, &channel_config);
+  APP_ERROR_CHECK(error_code);
 
+  /* Is this needed?
   nrfx_gpiote_out_config_t out_config = NRFX_GPIOTE_CONFIG_OUT_SIMPLE(true);
   error_code = nrfx_gpiote_out_init(RED_LED, &out_config);
   APP_ERROR_CHECK(error_code);
+   */
 }
 
-// sample a particular analog channel in blocking mode
-nrf_saadc_value_t sample_value (uint8_t channel) {
-  nrf_saadc_value_t val;
-  ret_code_t error_code = nrfx_saadc_sample_convert(channel, &val);
-  APP_ERROR_CHECK(error_code);
-  return val;
-}
-
-void ir_setup(void) {
+/**@brief Project Thamouse: Function for enabling Wiimote-like IR sensor.
+ *
+ * @details Sends series of I2C (called twi by Nordic) signals.
+ *
+ */
+void ir_setup(void) 
+{
     ret_code_t err_code;
 
     const nrf_drv_twi_config_t twi_config = {
-       .scl                = 26, //ARDUINO_SCL_PIN,
-       .sda                = 25, //ARDUINO_SDA_PIN,
+       .scl                = 26,        
+       .sda                = 25,        
        .frequency          = NRF_DRV_TWI_FREQ_100K,
        .interrupt_priority = APP_IRQ_PRIORITY_HIGH,
        .clear_bus_init     = false
@@ -1404,9 +1634,9 @@ void ir_setup(void) {
     nrf_drv_twi_enable(&m_twi);
 
     uint8_t package[2]; 
-    //Send #1: 0x30, 0x01 NEW: 0x13, 0x04
-    package[0] = 0x13;
-    package[1] = 0x04;
+    //Send #1: 0x01 to register 0x30
+    package[0] = 0x30;
+    package[1] = 0x01;
     err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
     nrf_delay_ms(100);
    
@@ -1422,9 +1652,9 @@ void ir_setup(void) {
         NRF_LOG_INFO("Fail 1");
     }
 
-    //Send #2: 0x30, 0x08 NEW: 0x1a, 0x04
-    package[0] = 0x1a;
-    package[1] = 0x04;
+    //Send #2: 0x08 to register 0x30
+    package[0] = 0x30;
+    package[1] = 0x08;
     err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
     nrf_delay_ms(100);   
     
@@ -1439,9 +1669,9 @@ void ir_setup(void) {
         nrf_gpio_pin_set(RED_LED);    
         NRF_LOG_INFO("Fail 2");
     }
-    //Send #3: 0x06, 0x90 NEW: 0x30, 0x08
-    package[0] = 0x30;
-    package[1] = 0x08;
+    //Send #3: 0x90 to register 0x06
+    package[0] = 0x06;
+    package[1] = 0x90;
     err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
     nrf_delay_ms(100);
     
@@ -1457,11 +1687,10 @@ void ir_setup(void) {
         NRF_LOG_INFO("Fail 3");
     }
 
-    //Send #4: 0x08, 0xc0 NEW: SENSTITIVITY 1
+    //Send #4: 0xc0 to register 0x08.  Possibly sensitivity data?
     package[0] = 0x08;
     package[1] = 0xc0;
-    uint8_t sens1[10]= {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0x00, 0xC0};
-    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) sens1, sizeof(sens1), false);
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
     nrf_delay_ms(100);
    
      nrf_gpio_pin_clear(RED_LED);
@@ -1475,11 +1704,10 @@ void ir_setup(void) {
     } else {
         nrf_gpio_pin_set(RED_LED);    
     }
-    //Send #5: 0x1a, 0x40 NEW: SENSITIVITY 2
+    //Send #5: 0x40 to register 0x1a.  More sensitivity?
     package[0] = 0x1a;
     package[1] = 0x40;
-    uint8_t sens2[3] = {0x1a, 0x40, 0x00};
-    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) sens2, sizeof(sens2), false);
+    err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
     nrf_delay_ms(100);
     
     nrf_gpio_pin_clear(RED_LED);
@@ -1493,9 +1721,9 @@ void ir_setup(void) {
         nrf_gpio_pin_set(RED_LED);    
         NRF_LOG_INFO("Fail 5");
     }
-    //Send #6: 0x33, 0x33
+    //Send #6: 0x33 to register 0x33.  Sets mode to "extended".
     package[0] = 0x33;
-    package[1] = 0x03;
+    package[1] = 0x33;
     err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
     nrf_delay_ms(100);
 
@@ -1510,7 +1738,8 @@ void ir_setup(void) {
         nrf_gpio_pin_set(RED_LED);    
         NRF_LOG_INFO("Fail 6");
     }
-    //Final init: 0x36 NEW 0x30, 0x08
+    
+    //Final init: 0x08 to register 0x30 again.
     package[0] = 0x30;
     package[1] = 0x08;
     err_code = nrf_drv_twi_tx(&m_twi, IR_ADDR, (uint8_t*) package, sizeof(package), false);
@@ -1527,81 +1756,6 @@ void ir_setup(void) {
         nrf_gpio_pin_set(RED_LED);    
         NRF_LOG_INFO("Fail 7");
     }
-}
-
-void ir_read(ir_points *pts) {
-    uint8_t irIn[12];
-    uint8_t s;
-    nrf_drv_twi_rx(&m_twi, IR_ADDR, (uint8_t*) irIn, sizeof(irIn));
-    pts->x[0] = irIn[0];
-    pts->y[0] = irIn[2];
-    s = irIn[3];
-    pts->x[0] += (s & 0x30) << 4;
-    pts->y[0] += (s & 0xc0) << 2;
-    
-    pts->x[1] = irIn[3];
-    pts->y[1] = irIn[4];
-    s = irIn[5];
-    pts->x[1] += (s & 0x30) << 4;
-    pts->y[1] += (s & 0xc0) << 2;
-
-    pts->x[2] = irIn[6];
-    pts->y[2] = irIn[7];
-    s = irIn[8];
-    pts->x[2] += (s & 0x30) << 4;
-    pts->y[2] += (s & 0xc0) << 2;
-
-    pts->x[3] = irIn[9];
-    pts->y[3] = irIn[10];
-    s = irIn[11];
-    pts->x[3] += (s & 0x30) << 4;
-    pts->y[3] += (s & 0xc0) << 2;
-    
-}
-
-void glove_read(void) {
-    // sample analog inputs
-    nrf_saadc_value_t x_val = sample_value(X_CHANNEL);
-    nrf_saadc_value_t y_val = sample_value(Y_CHANNEL);
-    nrf_saadc_value_t z_val = sample_value(Z_CHANNEL);
-
-    float x_volt = lsb*x_val;
-    float y_volt = lsb*y_val;
-    float z_volt = lsb*z_val;
-
-    //TODO Recheck supply voltage
-    float supply = 2.8;
-    float expected_sensitivity = 300.0*supply/3;
-    float expected_bias = 1.5*supply/3;
-    float x_g = 1000*(x_volt - expected_bias)/(expected_sensitivity);
-    float y_g = 1000*(y_volt - expected_bias)/(expected_sensitivity);
-    float z_g = 1000*(z_volt - expected_bias)/(expected_sensitivity);
-
-    float x_tilt = (180/M_PI)*atan(x_g/sqrt(pow(y_g,2) + pow(z_g,2)));
-    float y_tilt = (180/M_PI)*atan(y_g/sqrt(pow(x_g,2) + pow(z_g,2)));
-    float z_tilt = (180/M_PI)*atan(sqrt(pow(x_g,2) + pow(y_g,2))/z_g);
-
-    // display results
-    printf("g-forces\tx: %9.6f\ty: %9.6f\tz:%9.6f\n", x_g, y_g, z_g);
-    printf("Tilt\tx: %9.6f\ty: %9.6f\tz:%9.6f\n", x_tilt, y_tilt, z_tilt);
-    nrf_saadc_value_t f0 = sample_value(FINGER_0);
-    nrf_saadc_value_t f1 = sample_value(FINGER_1);
-    //nrf_saadc_value_t f2 = sample_value(FINGER_2);
-
-
-    // Clear LED if f1 (middle finger) pressed
-    // Hold LED if f0 (index) is pressed
-    // else toggle
-    
-    if ((uint32_t) f1 > 1500) {
-      mouse_movement_send(0, 5);
-
-    } else if ((uint32_t) f0 > 1500) {
-      mouse_movement_send(0, -5);
-
-    }
-
-
 }
 
 /**@brief Function for handling the idle state (main loop).
@@ -1638,9 +1792,11 @@ int main(void)
     sensor_simulator_init();
     conn_params_init();
     peer_manager_init();
-    NRF_LOG_INFO("IR SETUP...");
-    my_handler();
+
+    // Setup for Thamouse sensors:
+    analog_sensor_setup();
     ir_setup();
+
     // Start execution.
     timers_start();
     advertising_start(erase_bonds);
@@ -1650,24 +1806,6 @@ int main(void)
     for (;;)
     {
        idle_state_handle();
-        if (m_conn_handle != BLE_CONN_HANDLE_INVALID)
-        {
-            glove_read();
-        }
-
-        ir_read(&coords);
-        nrf_delay_ms(50);
-        for (int i = 0; i < 4; i++) {
-            NRF_LOG_INFO("X%d: %d", i, coords.x[i]);
-            nrf_delay_ms(50);
-            NRF_LOG_INFO("Y%d: %d", i, coords.y[i]);
-            nrf_delay_ms(50);
-        }  
-        
     } 
 }
 
-
-/**
- * @}
- */
